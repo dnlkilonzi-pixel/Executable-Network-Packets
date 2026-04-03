@@ -232,7 +232,10 @@ static void handle_packet(SOCKET sock,
         return;
     }
 
-    /* ---- Capability: budget ceiling check ---- */
+    /* ---- Capability: budget ceiling check ----
+     * Verify that the declared compute_budget does not exceed the cap. Since
+     * budget only decreases at each hop, a packet that passes this check at
+     * the first node will always pass it on subsequent nodes. */
     if (pkt.capability.cap_max_compute > 0 &&
             pkt.compute_budget != ENP_BUDGET_UNLIMITED &&
             pkt.compute_budget > pkt.capability.cap_max_compute) {
@@ -344,7 +347,12 @@ static void handle_packet(SOCKET sock,
     if (out.state[0] < 255) {
         out.state[0]++;
     } else {
-        ENP_LOG_WARN("state[0] hop-counter overflow at 255 - packet may have looped");
+        ENP_LOG_WARN("state[0] hop-counter overflow at 255 – dropping packet to prevent loop");
+        trace.action = ENP_TRACE_ACTION_DROPPED;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
+        return;
     }
     ENP_LOG_DBG("State: hop_counter=%u", (unsigned)out.state[0]);
 

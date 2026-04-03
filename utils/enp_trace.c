@@ -36,7 +36,7 @@ static const char *opcode_str(uint8_t opcode)
 static void fmt_state(const uint8_t *snap, char *out, size_t out_sz)
 {
     size_t pos = 0;
-    for (int i = 0; i < ENP_TRACE_STATE_SNAP && pos + 3 < out_sz; i++) {
+    for (int i = 0; i < ENP_TRACE_STATE_SNAP && pos + 4 <= out_sz; i++) {
         int n = snprintf(out + pos, out_sz - pos, "%02x", (unsigned)snap[i]);
         if (n < 0)
             break;

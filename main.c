@@ -222,11 +222,9 @@ static int run_client(const char *host, uint16_t port)
  * -------------------------------------------------------------------------*/
 static int run_route(const char *host, uint16_t port)
 {
-    int ok = 0;
-    (void)ok;  /* used only to satisfy the drop-confirmation path */
     static const int32_t test_vals[] = {50, 150};
     static const char   *expected[]  = {"FORWARD (50 <= 63, response expected)",
-                                        "DROP    (150 > 63,  no response – expect timeout)"};
+                                        "DROP    (150 > 63,  no response - expect timeout)"};
 
     for (int i = 0; i < 2; i++) {
         enp_packet_t pkt;
@@ -268,13 +266,11 @@ static int run_route(const char *host, uint16_t port)
             printf("  → Server replied (FORWARD confirmed)\n");
         } else if (i == 1) {
             /* Timeout on DROP is the correct behaviour */
-            printf("  → No reply (DROP confirmed)\n");
-            ok = 1;
+            printf("  -> No reply (DROP confirmed)\n");
         } else {
             ENP_LOG_ERR("Unexpected failure for input=%d", (int)test_vals[i]);
         }
     }
-    (void)ok;
     return 0;
 }
 
