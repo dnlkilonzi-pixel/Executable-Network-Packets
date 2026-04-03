@@ -16,7 +16,8 @@ THIRDDIR = third_party/wasm3
 
 BUILDDIR = build
 
-TARGET   = $(BUILDDIR)/enp
+TARGET     = $(BUILDDIR)/enp
+SIM_TARGET = $(BUILDDIR)/enp_sim
 
 # ---------------------------------------------------------------------------
 # wasm3 integration
@@ -48,14 +49,28 @@ SRCS = main.c \
 
 OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
 
+SIM_SRCS = sim/enp_sim.c \
+           $(COREDIR)/enp_packet.c \
+           $(UTILSDIR)/enp_logger.c \
+           $(UTILSDIR)/enp_trace.c
+
+SIM_OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(SIM_SRCS))
+
 # ---------------------------------------------------------------------------
 # Default target
 # ---------------------------------------------------------------------------
-.PHONY: all clean wasm3-fetch
+.PHONY: all sim clean wasm3-fetch
 
 all: $(TARGET)
 
+sim: $(SIM_TARGET)
+
 $(TARGET): $(OBJS)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+	@echo "Built: $@"
+
+$(SIM_TARGET): $(SIM_OBJS)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
 	@echo "Built: $@"
