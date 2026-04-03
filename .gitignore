@@ -1,0 +1,29 @@
+# Build artifacts
+build/
+cmake-build-*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+Makefile.cmake
+
+# wasm3 (fetched by build system)
+third_party/wasm3/
+
+# Binaries
+enp
+enp.exe
+*.o
+*.a
+*.so
+*.dll
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
