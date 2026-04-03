@@ -3,6 +3,9 @@
  *
  * Integrates the wasm3 interpreter to safely run WASM bytecode
  * embedded in ENP packets.  Enforces memory and time limits.
+ *
+ * Both enp_wasm_exec (calls "process") and enp_wasm_exec_route (calls
+ * "route_decide") share a single internal helper to avoid duplication.
  */
 
 #include "enp_wasm.h"
@@ -24,8 +27,8 @@
 #  include <setjmp.h>
 #  include <unistd.h>
 
-static volatile int       g_timed_out  = 0;
-static sigjmp_buf         g_timeout_jmp;
+static volatile int g_timed_out = 0;
+static sigjmp_buf   g_timeout_jmp;
 
 static void sigalrm_handler(int sig)
 {
@@ -35,10 +38,15 @@ static void sigalrm_handler(int sig)
 }
 #endif /* !_WIN32 */
 
-enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
-                                 int32_t input, int32_t *output)
+/* -------------------------------------------------------------------------
+ * Internal helper: load WASM module, call fn_name(i32 input) -> i32,
+ * store result in *output.
+ * -------------------------------------------------------------------------*/
+static enp_wasm_result_t exec_wasm_i32(const uint8_t *code, size_t code_len,
+                                        const char *fn_name,
+                                        int32_t input, int32_t *output)
 {
-    if (!code || code_len == 0 || !output)
+    if (!code || code_len == 0 || !fn_name || !output)
         return ENP_WASM_ERR;
 
     enp_wasm_result_t result = ENP_WASM_ERR;
@@ -86,16 +94,16 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
     }
 
     IM3Function fn = NULL;
-    err = m3_FindFunction(&fn, runtime, "process");
+    err = m3_FindFunction(&fn, runtime, fn_name);
     if (err) {
-        ENP_LOG_ERR("wasm3: function 'process' not found: %s", err);
+        ENP_LOG_ERR("wasm3: function '%s' not found: %s", fn_name, err);
         m3_FreeRuntime(runtime);
         m3_FreeEnvironment(env);
         return ENP_WASM_ERR;
     }
 
     /* ------------------------------------------------------------------
-     * Execute with timeout via SIGALRM (POSIX only)
+     * Execute with SIGALRM timeout (POSIX only).
      * On Windows we call directly without a timeout mechanism.
      * ------------------------------------------------------------------*/
 #if !defined(_WIN32)
@@ -113,7 +121,6 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
     if (sigsetjmp(g_timeout_jmp, 1) == 0) {
         err = m3_CallV(fn, (uint32_t)input);
     } else {
-        /* jumped here by SIGALRM handler */
         ENP_LOG_WARN("wasm3: execution timed out after %u seconds", timeout_sec);
         result = ENP_WASM_TIMEOUT;
         alarm(0);
@@ -126,12 +133,11 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
     alarm(0);
     sigaction(SIGALRM, &sa_old, NULL);
 #else
-    /* Windows: call without timeout */
     err = m3_CallV(fn, (uint32_t)input);
 #endif
 
     if (err) {
-        ENP_LOG_ERR("wasm3: call failed: %s", err);
+        ENP_LOG_ERR("wasm3: call to '%s' failed: %s", fn_name, err);
         m3_FreeRuntime(runtime);
         m3_FreeEnvironment(env);
         return ENP_WASM_ERR;
@@ -149,7 +155,7 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
     *output = (int32_t)(uint32_t)ret;
     result  = ENP_WASM_OK;
 
-    ENP_LOG_INFO("wasm3: process(%d) = %d", (int)input, (int)*output);
+    ENP_LOG_INFO("wasm3: %s(%d) = %d", fn_name, (int)input, (int)*output);
 
     m3_FreeRuntime(runtime);
     m3_FreeEnvironment(env);
@@ -157,24 +163,55 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
 }
 
 /* -------------------------------------------------------------------------
- * Fallback stub (no wasm3)
- *
- * When ENP_WITH_WASM3 is not defined the server still compiles and runs
- * but returns an error for ENP_EXEC packets.  This allows the networking
- * and serialisation layers to be tested without the WASM dependency.
+ * Public API
+ * -------------------------------------------------------------------------*/
+
+enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
+                                 int32_t input, int32_t *output)
+{
+    return exec_wasm_i32(code, code_len, "process", input, output);
+}
+
+enp_wasm_result_t enp_wasm_exec_route(const uint8_t *code, size_t code_len,
+                                       int32_t input,
+                                       enp_route_decision_t *decision)
+{
+    if (!decision)
+        return ENP_WASM_ERR;
+
+    int32_t action = 0;
+    enp_wasm_result_t res = exec_wasm_i32(code, code_len, "route_decide",
+                                           input, &action);
+    if (res == ENP_WASM_OK) {
+        decision->action = (uint8_t)action;
+        ENP_LOG_INFO("wasm3: route_decide(%d) → action=%u", (int)input,
+                     (unsigned)decision->action);
+    }
+    return res;
+}
+
+/* -------------------------------------------------------------------------
+ * Fallback stubs (no wasm3)
  * -------------------------------------------------------------------------*/
 #else  /* !ENP_WITH_WASM3 */
 
 enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
                                  int32_t input, int32_t *output)
 {
-    (void)code;
-    (void)code_len;
-    (void)input;
-    (void)output;
+    (void)code; (void)code_len; (void)input; (void)output;
     ENP_LOG_WARN("wasm3 not available – ENP_EXEC not supported in this build");
     return ENP_WASM_ERR;
 }
 
-#endif /* ENP_WITH_WASM3 */
+enp_wasm_result_t enp_wasm_exec_route(const uint8_t *code, size_t code_len,
+                                       int32_t input,
+                                       enp_route_decision_t *decision)
+{
+    (void)code; (void)code_len; (void)input;
+    ENP_LOG_WARN("wasm3 not available – ENP_ROUTE_DECIDE not supported in this build");
+    if (decision)
+        decision->action = ENP_ACTION_FORWARD;  /* safe default: always forward */
+    return ENP_WASM_ERR;
+}
 
+#endif /* ENP_WITH_WASM3 */

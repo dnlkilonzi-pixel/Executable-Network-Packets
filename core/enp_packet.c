@@ -95,6 +95,17 @@ int enp_packet_serialize(const enp_packet_t *pkt, uint8_t *buf, size_t size)
     write_u64_be(buf + off, pkt->timestamp);  off += 8;
     write_u16_be(buf + off, pkt->payload_len); off += 2;
     write_u16_be(buf + off, pkt->code_len);   off += 2;
+    /* v2: routing */
+    buf[off++] = pkt->hop_count;
+    buf[off++] = pkt->hop_index;
+    for (int i = 0; i < ENP_MAX_HOPS; i++) {
+        write_u32_be(buf + off, pkt->hops[i]);      off += 4;
+    }
+    for (int i = 0; i < ENP_MAX_HOPS; i++) {
+        write_u16_be(buf + off, pkt->hop_ports[i]); off += 2;
+    }
+    /* v2: state */
+    memcpy(buf + off, pkt->state, ENP_STATE_LEN); off += ENP_STATE_LEN;
 
     /* Sanity-check: header size must match */
     if (off != ENP_HEADER_SIZE)
@@ -131,8 +142,19 @@ int enp_packet_deserialize(const uint8_t *buf, size_t size, enp_packet_t *pkt)
     pkt->timestamp   = read_u64_be(buf + off); off += 8;
     pkt->payload_len = read_u16_be(buf + off); off += 2;
     pkt->code_len    = read_u16_be(buf + off); off += 2;
+    /* v2: routing */
+    pkt->hop_count   = buf[off++];
+    pkt->hop_index   = buf[off++];
+    for (int i = 0; i < ENP_MAX_HOPS; i++) {
+        pkt->hops[i]      = read_u32_be(buf + off); off += 4;
+    }
+    for (int i = 0; i < ENP_MAX_HOPS; i++) {
+        pkt->hop_ports[i] = read_u16_be(buf + off); off += 2;
+    }
+    /* v2: state */
+    memcpy(pkt->state, buf + off, ENP_STATE_LEN); off += ENP_STATE_LEN;
 
-    /* Validate lengths before accessing data */
+    /* Validate lengths before accessing variable-length data */
     if (pkt->payload_len > ENP_PAYLOAD_MAX_LEN || pkt->code_len > ENP_CODE_MAX_LEN) {
         ENP_LOG_ERR("Packet lengths exceed limits: payload=%u code=%u",
                     pkt->payload_len, pkt->code_len);
@@ -167,7 +189,9 @@ int enp_packet_validate(const enp_packet_t *pkt)
         return -1;
     }
 
-    if (pkt->opcode != ENP_FORWARD && pkt->opcode != ENP_EXEC) {
+    if (pkt->opcode != ENP_FORWARD &&
+        pkt->opcode != ENP_EXEC    &&
+        pkt->opcode != ENP_ROUTE_DECIDE) {
         ENP_LOG_WARN("Invalid opcode: %u", pkt->opcode);
         return -1;
     }
@@ -182,8 +206,19 @@ int enp_packet_validate(const enp_packet_t *pkt)
         return -1;
     }
 
-    if (pkt->opcode == ENP_EXEC && pkt->code_len == 0) {
-        ENP_LOG_WARN("ENP_EXEC packet has no WASM code");
+    if ((pkt->opcode == ENP_EXEC || pkt->opcode == ENP_ROUTE_DECIDE)
+            && pkt->code_len == 0) {
+        ENP_LOG_WARN("Opcode %u requires WASM code but code_len == 0", pkt->opcode);
+        return -1;
+    }
+
+    if (pkt->hop_count > ENP_MAX_HOPS) {
+        ENP_LOG_WARN("hop_count %u exceeds max %u", pkt->hop_count, ENP_MAX_HOPS);
+        return -1;
+    }
+
+    if (pkt->hop_count > 0 && pkt->hop_index >= pkt->hop_count) {
+        ENP_LOG_WARN("hop_index %u >= hop_count %u", pkt->hop_index, pkt->hop_count);
         return -1;
     }
 

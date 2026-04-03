@@ -10,6 +10,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "enp_packet.h"  /* for enp_route_decision_t */
 
 /* WASM execution limits */
 #define ENP_WASM_STACK_SIZE      (64 * 1024)  /* 64 KiB interpreter stack */
@@ -25,11 +26,10 @@ typedef enum {
 } enp_wasm_result_t;
 
 /*
- * Execute WASM bytecode from an ENP packet.
+ * Execute WASM bytecode for ENP_EXEC packets.
  *
- * Loads the WASM module from 'code', calls the exported function "process"
- * with 'input' as the sole i32 argument, and stores the i32 return value
- * in '*output'.
+ * Calls the exported function "process(i32 x) -> i32" with 'input' and
+ * stores the return value in '*output'.
  *
  * @param code       Pointer to WASM bytecode.
  * @param code_len   Length of WASM bytecode in bytes.
@@ -39,5 +39,22 @@ typedef enum {
  */
 enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
                                  int32_t input, int32_t *output);
+
+/*
+ * Execute WASM bytecode for ENP_ROUTE_DECIDE packets.
+ *
+ * Calls the exported function "route_decide(i32 x) -> i32".  The return
+ * value is an enp_route_action_t (0=FORWARD, 1=DROP, 2=CLONE).
+ * The next hop is determined from the packet's hops[] table by the caller.
+ *
+ * @param code       Pointer to WASM bytecode.
+ * @param code_len   Length of WASM bytecode in bytes.
+ * @param input      Input integer from payload.
+ * @param decision   Output: routing decision populated on success.
+ * @return           ENP_WASM_OK on success, negative on failure.
+ */
+enp_wasm_result_t enp_wasm_exec_route(const uint8_t *code, size_t code_len,
+                                       int32_t input,
+                                       enp_route_decision_t *decision);
 
 #endif /* ENP_WASM_H */
