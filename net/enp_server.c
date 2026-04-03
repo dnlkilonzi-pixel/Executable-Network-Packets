@@ -10,6 +10,19 @@
  *   When hop_count > 0, after processing the packet is forwarded to the
  *   next node in hops[], or the response is returned to hops[0]:hop_ports[0]
  *   (the original client's return address) when the last node is reached.
+ *
+ * Capability enforcement (v3):
+ *   If allowed_ops != 0 and the packet's opcode is not in the mask, the
+ *   node sets ENP_FLAG_CAP_DENIED and returns an error response.
+ *
+ * Execution budgeting (v3):
+ *   compute_budget == 0xFFFF  -> unlimited (never decremented).
+ *   compute_budget == 0       -> exhausted; WASM ops are refused.
+ *   compute_budget > 0        -> decremented by 1 per WASM execution.
+ *
+ * Observability (v3):
+ *   Every handled packet produces an enp_trace_record_t logged via
+ *   enp_trace_log() capturing timing, budget, state diff, and action.
  */
 
 #define _POSIX_C_SOURCE 200112L
@@ -17,6 +30,7 @@
 #include "enp_net.h"
 #include "enp_packet.h"
 #include "enp_wasm.h"
+#include "enp_trace.h"
 #include "enp_logger.h"
 
 #include <string.h>
@@ -114,6 +128,31 @@ static void i32_to_payload(enp_packet_t *pkt, int32_t v)
 }
 
 /* -------------------------------------------------------------------------
+ * Internal: snap first ENP_TRACE_STATE_SNAP bytes of state into dst[]
+ * -------------------------------------------------------------------------*/
+static void snap_state(const enp_packet_t *pkt,
+                       uint8_t dst[ENP_TRACE_STATE_SNAP])
+{
+    memcpy(dst, pkt->state, ENP_TRACE_STATE_SNAP);
+}
+
+/* -------------------------------------------------------------------------
+ * Internal: send an error response (capability or budget failure)
+ * -------------------------------------------------------------------------*/
+static void send_error_response(SOCKET sock,
+                                 enp_packet_t *out,
+                                 const struct sockaddr_in *client_addr,
+                                 socklen_t addr_len)
+{
+    out->flags |= ENP_FLAG_RESPONSE;
+    uint8_t resp_buf[ENP_MAX_PACKET_SIZE];
+    int resp_len = enp_packet_serialize(out, resp_buf, sizeof(resp_buf));
+    if (resp_len > 0)
+        sendto(sock, (const char *)resp_buf, resp_len, 0,
+               (const struct sockaddr *)client_addr, addr_len);
+}
+
+/* -------------------------------------------------------------------------
  * Internal: handle a single incoming packet
  * -------------------------------------------------------------------------*/
 static void handle_packet(SOCKET sock,
@@ -124,29 +163,106 @@ static void handle_packet(SOCKET sock,
 {
     enp_packet_t pkt;
     if (enp_packet_deserialize(raw, raw_len, &pkt) != 0) {
-        ENP_LOG_WARN("Received malformed packet – discarding");
+        ENP_LOG_WARN("Received malformed packet - discarding");
         return;
     }
 
     if (enp_packet_validate(&pkt) != 0) {
-        ENP_LOG_WARN("Packet failed validation – discarding");
+        ENP_LOG_WARN("Packet failed validation - discarding");
         return;
     }
 
     ENP_LOG_INFO("Received packet id=%llu src=0x%08X opcode=%u "
-                 "hop=%u/%u payload_len=%u code_len=%u state[0]=%u",
+                 "hop=%u/%u payload_len=%u code_len=%u "
+                 "state[0]=%u budget=%u allowed_ops=0x%08X",
                  (unsigned long long)pkt.packet_id,
                  pkt.src,
                  (unsigned)pkt.opcode,
                  (unsigned)pkt.hop_index,
                  (unsigned)pkt.hop_count,
                  pkt.payload_len, pkt.code_len,
-                 (unsigned)pkt.state[0]);
+                 (unsigned)pkt.state[0],
+                 (unsigned)pkt.compute_budget,
+                 (unsigned)pkt.capability.allowed_ops);
+
+    /* Initialise trace record */
+    enp_trace_record_t trace;
+    memset(&trace, 0, sizeof(trace));
+    trace.packet_id     = pkt.packet_id;
+    trace.hop_index     = pkt.hop_index;
+    trace.hop_count     = pkt.hop_count;
+    trace.opcode        = pkt.opcode;
+    trace.input         = payload_to_i32(&pkt);
+    trace.budget_before = pkt.compute_budget;
+    snap_state(&pkt, trace.state_before);
 
     /* Build working copy for response / forwarding */
     enp_packet_t out;
     memcpy(&out, &pkt, sizeof(out));
     out.timestamp = enp_timestamp_ms();
+
+    /* ---- Capability: opcode check ---- */
+    if (pkt.capability.allowed_ops != ENP_OP_ALL &&
+            !(pkt.capability.allowed_ops & ENP_OP_BIT(pkt.opcode))) {
+        ENP_LOG_WARN("Capability: opcode %u not permitted (allowed_ops=0x%08X) "
+                     "- sending CAP_DENIED error",
+                     (unsigned)pkt.opcode,
+                     (unsigned)pkt.capability.allowed_ops);
+        out.flags |= ENP_FLAG_ERROR | ENP_FLAG_CAP_DENIED;
+        trace.action = ENP_TRACE_ACTION_ERROR;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
+        send_error_response(sock, &out, client_addr, addr_len);
+        return;
+    }
+
+    /* ---- Capability: hop count ceiling check ---- */
+    if (pkt.capability.cap_max_hops > 0 &&
+            pkt.hop_count > pkt.capability.cap_max_hops) {
+        ENP_LOG_WARN("Capability: hop_count %u > cap_max_hops %u - CAP_DENIED",
+                     (unsigned)pkt.hop_count,
+                     (unsigned)pkt.capability.cap_max_hops);
+        out.flags |= ENP_FLAG_ERROR | ENP_FLAG_CAP_DENIED;
+        trace.action = ENP_TRACE_ACTION_ERROR;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
+        send_error_response(sock, &out, client_addr, addr_len);
+        return;
+    }
+
+    /* ---- Capability: budget ceiling check ---- */
+    if (pkt.capability.cap_max_compute > 0 &&
+            pkt.compute_budget != ENP_BUDGET_UNLIMITED &&
+            pkt.compute_budget > pkt.capability.cap_max_compute) {
+        ENP_LOG_WARN("Capability: compute_budget %u > cap_max_compute %u - CAP_DENIED",
+                     (unsigned)pkt.compute_budget,
+                     (unsigned)pkt.capability.cap_max_compute);
+        out.flags |= ENP_FLAG_ERROR | ENP_FLAG_CAP_DENIED;
+        trace.action = ENP_TRACE_ACTION_ERROR;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
+        send_error_response(sock, &out, client_addr, addr_len);
+        return;
+    }
+
+    /* ---- Budget check: refuse WASM execution if budget is exhausted ---- */
+    int needs_wasm = (pkt.opcode == ENP_EXEC || pkt.opcode == ENP_ROUTE_DECIDE);
+    if (needs_wasm &&
+            pkt.compute_budget != ENP_BUDGET_UNLIMITED &&
+            pkt.compute_budget == 0) {
+        ENP_LOG_WARN("Compute budget exhausted for packet id=%llu - refusing WASM",
+                     (unsigned long long)pkt.packet_id);
+        out.flags |= ENP_FLAG_ERROR | ENP_FLAG_BUDGET_EXHAUSTED;
+        trace.action = ENP_TRACE_ACTION_BUDGET_EXH;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
+        send_error_response(sock, &out, client_addr, addr_len);
+        return;
+    }
 
     /* ---- Opcode dispatch ---- */
     int32_t input = payload_to_i32(&pkt);
@@ -162,11 +278,20 @@ static void handle_packet(SOCKET sock,
         ENP_LOG_INFO("Opcode ENP_EXEC: executing WASM (%u bytes) input=%d",
                      pkt.code_len, (int)input);
         int32_t output = 0;
+        uint64_t t0 = enp_timestamp_us();
         enp_wasm_result_t wres = enp_wasm_exec(pkt.code, pkt.code_len,
                                                 input, &output);
+        uint64_t t1 = enp_timestamp_us();
+        trace.exec_us = (t1 > t0) ? (uint32_t)(t1 - t0) : 0u;
+
         if (wres == ENP_WASM_OK) {
-            ENP_LOG_INFO("WASM result: %d", (int)output);
+            ENP_LOG_INFO("WASM result: %d  (exec_us=%u)", (int)output,
+                         (unsigned)trace.exec_us);
             i32_to_payload(&out, output);
+            trace.output = output;
+            /* Decrement budget (skip if unlimited) */
+            if (out.compute_budget != ENP_BUDGET_UNLIMITED)
+                out.compute_budget--;
         } else {
             ENP_LOG_ERR("WASM execution failed (result=%d)", (int)wres);
             out.flags |= ENP_FLAG_ERROR;
@@ -178,17 +303,26 @@ static void handle_packet(SOCKET sock,
         ENP_LOG_INFO("Opcode ENP_ROUTE_DECIDE: executing route_decide WASM "
                      "(%u bytes) input=%d", pkt.code_len, (int)input);
         enp_route_decision_t decision;
+        uint64_t t0 = enp_timestamp_us();
         enp_wasm_result_t wres = enp_wasm_exec_route(pkt.code, pkt.code_len,
                                                       input, &decision);
+        uint64_t t1 = enp_timestamp_us();
+        trace.exec_us = (t1 > t0) ? (uint32_t)(t1 - t0) : 0u;
+
         if (wres == ENP_WASM_OK) {
-            ENP_LOG_INFO("Route decision: action=%u", (unsigned)decision.action);
+            ENP_LOG_INFO("Route decision: action=%u  (exec_us=%u)",
+                         (unsigned)decision.action, (unsigned)trace.exec_us);
+            trace.route_action = decision.action;
             if (decision.action == ENP_ACTION_DROP) {
-                ENP_LOG_INFO("Routing decision: DROP – discarding packet");
+                ENP_LOG_INFO("Routing decision: DROP - discarding packet");
                 drop = 1;
             }
             /* ENP_ACTION_CLONE treated same as FORWARD in this prototype */
+            /* Decrement budget (skip if unlimited) */
+            if (out.compute_budget != ENP_BUDGET_UNLIMITED)
+                out.compute_budget--;
         } else {
-            ENP_LOG_ERR("route_decide WASM failed – defaulting to FORWARD");
+            ENP_LOG_ERR("route_decide WASM failed - defaulting to FORWARD");
         }
         break;
     }
@@ -198,14 +332,19 @@ static void handle_packet(SOCKET sock,
         return;
     }
 
-    if (drop)
+    if (drop) {
+        trace.action = ENP_TRACE_ACTION_DROPPED;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
         return;
+    }
 
     /* ---- State mutation: increment hop counter ---- */
     if (out.state[0] < 255) {
         out.state[0]++;
     } else {
-        ENP_LOG_WARN("state[0] hop-counter overflow at 255 – packet may have looped");
+        ENP_LOG_WARN("state[0] hop-counter overflow at 255 - packet may have looped");
     }
     ENP_LOG_DBG("State: hop_counter=%u", (unsigned)out.state[0]);
 
@@ -222,16 +361,24 @@ static void handle_packet(SOCKET sock,
                          (unsigned)out.hop_count,
                          out.hops[out.hop_index],
                          (unsigned)out.hop_ports[out.hop_index]);
+            trace.action = ENP_TRACE_ACTION_FORWARDED;
+            snap_state(&out, trace.state_after);
+            trace.budget_after = out.compute_budget;
+            enp_trace_log(&trace);
             send_to_addr(&out, out.hops[out.hop_index], out.hop_ports[out.hop_index]);
-            return;   /* don't also reply to immediate sender */
+            return;
         }
 
         /* Last node: return to the originator (hops[0]:hop_ports[0]) */
         out.flags |= ENP_FLAG_RESPONSE;
         uint32_t ret_ip   = out.hops[0];
         uint16_t ret_port = out.hop_ports[0];
-        ENP_LOG_INFO("Multi-hop: last node – returning to originator [%08X:%u]",
+        ENP_LOG_INFO("Multi-hop: last node - returning to originator [%08X:%u]",
                      ret_ip, (unsigned)ret_port);
+        trace.action = ENP_TRACE_ACTION_REPLIED;
+        snap_state(&out, trace.state_after);
+        trace.budget_after = out.compute_budget;
+        enp_trace_log(&trace);
         send_to_addr(&out, ret_ip, ret_port);
         return;
     }
@@ -245,6 +392,11 @@ static void handle_packet(SOCKET sock,
         return;
     }
 
+    trace.action = ENP_TRACE_ACTION_REPLIED;
+    snap_state(&out, trace.state_after);
+    trace.budget_after = out.compute_budget;
+    enp_trace_log(&trace);
+
     int sent = (int)sendto(sock, (const char *)resp_buf, resp_len, 0,
                            (const struct sockaddr *)client_addr, addr_len);
     if (sent == SOCKET_ERROR) {
@@ -252,7 +404,7 @@ static void handle_packet(SOCKET sock,
     } else {
         ENP_LOG_INFO("Response sent (%d bytes)", sent);
     }
-    (void)srv_port;  /* used only for potential future per-hop port logic */
+    (void)srv_port;
 }
 
 /* -------------------------------------------------------------------------

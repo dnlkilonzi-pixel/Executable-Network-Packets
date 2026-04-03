@@ -8,6 +8,10 @@
  *   - ENP_ROUTE_DECIDE opcode: WASM decides packet routing at each hop
  *   - Stateful packets: 128-byte state buffer carried across nodes
  *   - Multi-node execution: source-routed hop list with return address
+ *
+ * Protocol version 3 adds:
+ *   - Capability model: per-packet allowed_ops mask + max_hops / max_compute
+ *   - Execution budgeting: compute_budget decremented per WASM node
  */
 
 #ifndef ENP_PACKET_H
@@ -24,6 +28,9 @@
 #define ENP_MAX_HOPS   4    /* Maximum hops in a route list (including return addr) */
 #define ENP_STATE_LEN  128  /* Size of the per-packet state buffer */
 
+/* Compute budget sentinel: 0xFFFF = unlimited (never decremented or rejected) */
+#define ENP_BUDGET_UNLIMITED  0xFFFFu
+
 /* Wire format header size (bytes):
  *
  *  Base (v1-compatible):
@@ -35,18 +42,25 @@
  *
  *  v2 extensions:
  *  + 1  hop_count      +  1  hop_index
- *  + 4*ENP_MAX_HOPS(16) hops[]     (IPv4 addresses, host byte order on wire → big-endian)
+ *  + 4*ENP_MAX_HOPS(16) hops[]      (IPv4 addresses → big-endian)
  *  + 2*ENP_MAX_HOPS( 8) hop_ports[] (UDP ports)
  *  + ENP_STATE_LEN(128) state[]
  *  = 32 + 2 + 16 + 8 + 128 = 186 bytes
+ *
+ *  v3 extensions:
+ *  + 4  allowed_ops   (capability bitmask: bit N = opcode N is permitted)
+ *  + 1  cap_max_hops  (0 = no limit; else max hop_count this packet may use)
+ *  + 1  cap_max_compute (0 = no limit; else max initial compute_budget)
+ *  + 2  compute_budget (0xFFFF = unlimited; 0 = exhausted; else remaining)
+ *  = 186 + 8 = 194 bytes
  */
-#define ENP_HEADER_SIZE 186
+#define ENP_HEADER_SIZE 194
 
 /* Maximum total serialized packet size */
 #define ENP_MAX_PACKET_SIZE (ENP_HEADER_SIZE + ENP_PAYLOAD_MAX_LEN + ENP_CODE_MAX_LEN)
 
 /* Protocol version */
-#define ENP_VERSION 2
+#define ENP_VERSION 3
 
 /* Opcode definitions */
 typedef enum {
@@ -54,6 +68,10 @@ typedef enum {
     ENP_EXEC         = 1,  /* Execute embedded WASM, return result       */
     ENP_ROUTE_DECIDE = 2   /* WASM decides routing action at this node   */
 } enp_opcode_t;
+
+/* allowed_ops bitmask helpers */
+#define ENP_OP_BIT(opcode)   (1u << (unsigned)(opcode))
+#define ENP_OP_ALL           0u   /* 0 = no restriction (all ops allowed) */
 
 /* Route action values returned by the route_decide WASM function */
 typedef enum {
@@ -64,13 +82,30 @@ typedef enum {
 
 /* Routing decision produced by ENP_ROUTE_DECIDE WASM execution */
 typedef struct {
-    uint8_t  action;   /* enp_route_action_t                                  */
+    uint8_t  action;   /* enp_route_action_t */
 } enp_route_decision_t;
 
+/*
+ * Per-packet capability token.
+ *
+ * allowed_ops:   Bitmask of permitted opcodes (ENP_OP_BIT(ENP_EXEC) etc.).
+ *                0 means no restriction.
+ * cap_max_hops:  Maximum allowed hop_count for this packet.  0 = no limit.
+ * cap_max_compute: Maximum initial compute_budget this packet may declare.
+ *                  0 = no limit.
+ */
+typedef struct {
+    uint32_t allowed_ops;
+    uint8_t  cap_max_hops;
+    uint8_t  cap_max_compute;
+} enp_capability_t;
+
 /* Flag bits */
-#define ENP_FLAG_RESPONSE  (1u << 0)  /* Packet is a response           */
-#define ENP_FLAG_ERROR     (1u << 1)  /* Packet signals an error        */
-#define ENP_FLAG_MULTIHOP  (1u << 2)  /* Packet is source-routed        */
+#define ENP_FLAG_RESPONSE         (1u << 0)  /* Packet is a response               */
+#define ENP_FLAG_ERROR            (1u << 1)  /* Packet signals an error            */
+#define ENP_FLAG_MULTIHOP         (1u << 2)  /* Packet is source-routed            */
+#define ENP_FLAG_BUDGET_EXHAUSTED (1u << 3)  /* Compute budget was exhausted       */
+#define ENP_FLAG_CAP_DENIED       (1u << 4)  /* Capability check failed            */
 
 /* ENP Packet structure (in-memory representation)
  *
@@ -88,6 +123,13 @@ typedef struct {
  * State:
  *   state[0] is reserved as a hop-counter (incremented by each node).
  *   state[1..127] is available for application-level cross-node state.
+ *
+ * Capability + Budget:
+ *   capability.allowed_ops: bitmask of opcodes this packet may use.
+ *   capability.cap_max_hops: if > 0, hop_count must not exceed this.
+ *   capability.cap_max_compute: if > 0, compute_budget must not exceed this.
+ *   compute_budget: 0xFFFF = unlimited; 0 = exhausted; N = N units remaining.
+ *   Each WASM-executing node decrements compute_budget by 1.
  */
 typedef struct {
     uint8_t  version;
@@ -106,6 +148,9 @@ typedef struct {
     uint16_t hop_ports[ENP_MAX_HOPS];   /* UDP ports for each hop            */
     /* v2: stateful packets */
     uint8_t  state[ENP_STATE_LEN];      /* Cross-node state buffer           */
+    /* v3: capability + budgeting */
+    enp_capability_t capability;        /* Trust / capability token          */
+    uint16_t compute_budget;            /* Execution budget (units)          */
     /* variable-length fields */
     uint8_t  payload[ENP_PAYLOAD_MAX_LEN];
     uint8_t  code[ENP_CODE_MAX_LEN];
@@ -143,5 +188,11 @@ int enp_packet_validate(const enp_packet_t *pkt);
  * Get a current 64-bit UNIX timestamp in milliseconds.
  */
 uint64_t enp_timestamp_ms(void);
+
+/*
+ * Get a current 64-bit UNIX timestamp in microseconds.
+ * Used for high-resolution WASM execution timing.
+ */
+uint64_t enp_timestamp_us(void);
 
 #endif /* ENP_PACKET_H */

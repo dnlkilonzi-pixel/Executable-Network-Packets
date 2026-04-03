@@ -141,9 +141,13 @@ static void print_usage(const char *prog)
             "  %s route <host> [port]\n"
             "      Single-hop ENP_ROUTE_DECIDE demo\n\n"
             "  %s multihop <hostA> <portA> <hostB> <portB>\n"
-            "      Two-hop ENP_EXEC demo: 3 → 6 → 12\n"
-            "      (Run two server instances first)\n",
-            prog, ENP_DEFAULT_PORT, prog, prog, prog);
+            "      Two-hop ENP_EXEC demo: 3 -> 6 -> 12\n"
+            "      (Run two server instances first)\n\n"
+            "  %s inspect <host> [port]\n"
+            "      Capability + budget demo:\n"
+            "        (a) packet with restricted allowed_ops -> CAP_DENIED\n"
+            "        (b) packet with budget=1 sent to two nodes -> BUDGET_EXHAUSTED\n",
+            prog, ENP_DEFAULT_PORT, prog, prog, prog, prog);
 }
 
 /* -------------------------------------------------------------------------
@@ -161,6 +165,13 @@ static int run_client(const char *host, uint16_t port)
     pkt.packet_id = 1;
     pkt.timestamp = enp_timestamp_ms();
 
+    /* Capability: allow EXEC opcode only; no hop or compute limit */
+    pkt.capability.allowed_ops     = ENP_OP_BIT(ENP_EXEC);
+    pkt.capability.cap_max_hops    = 0;   /* no limit */
+    pkt.capability.cap_max_compute = 0;   /* no limit */
+    /* Budget: 5 executions allowed */
+    pkt.compute_budget = 5;
+
     int32_t input_val = 5;
     encode_i32_payload(&pkt, input_val);
 
@@ -171,8 +182,9 @@ static int run_client(const char *host, uint16_t port)
     pkt.code_len = (uint16_t)sizeof(PROCESS_WASM);
     memcpy(pkt.code, PROCESS_WASM, sizeof(PROCESS_WASM));
 
-    ENP_LOG_INFO("Sending ENP_EXEC: process(%d) to %s:%u",
-                 (int)input_val, host, (unsigned)port);
+    ENP_LOG_INFO("Sending ENP_EXEC: process(%d) to %s:%u (budget=%u)",
+                 (int)input_val, host, (unsigned)port,
+                 (unsigned)pkt.compute_budget);
 
     enp_packet_t response;
     memset(&response, 0, sizeof(response));
@@ -183,14 +195,22 @@ static int run_client(const char *host, uint16_t port)
     }
 
     if (response.flags & ENP_FLAG_ERROR) {
-        ENP_LOG_ERR("Server returned an error response");
+        if (response.flags & ENP_FLAG_CAP_DENIED)
+            ENP_LOG_ERR("Server denied request: capability check failed");
+        else if (response.flags & ENP_FLAG_BUDGET_EXHAUSTED)
+            ENP_LOG_ERR("Server denied request: compute budget exhausted");
+        else
+            ENP_LOG_ERR("Server returned an error response");
         return -1;
     }
 
     int32_t result = decode_i32_payload(&response);
-    ENP_LOG_INFO("Result: process(%d) = %d  (state[0]/hops=%u)",
-                 (int)input_val, (int)result, (unsigned)response.state[0]);
-    printf("ENP_EXEC result: process(%d) = %d\n", (int)input_val, (int)result);
+    ENP_LOG_INFO("Result: process(%d) = %d  (state[0]/hops=%u budget_remaining=%u)",
+                 (int)input_val, (int)result,
+                 (unsigned)response.state[0],
+                 (unsigned)response.compute_budget);
+    printf("ENP_EXEC result: process(%d) = %d  (budget remaining: %u)\n",
+           (int)input_val, (int)result, (unsigned)response.compute_budget);
     return 0;
 }
 
@@ -218,6 +238,12 @@ static int run_route(const char *host, uint16_t port)
         pkt.dst       = 0x7F000001u;
         pkt.packet_id = (uint64_t)(10 + i);
         pkt.timestamp = enp_timestamp_ms();
+
+        /* Capability: allow ROUTE_DECIDE only; unlimited budget */
+        pkt.capability.allowed_ops     = ENP_OP_BIT(ENP_ROUTE_DECIDE);
+        pkt.capability.cap_max_hops    = 0;
+        pkt.capability.cap_max_compute = 0;
+        pkt.compute_budget = ENP_BUDGET_UNLIMITED;
 
         encode_i32_payload(&pkt, test_vals[i]);
 
@@ -310,6 +336,12 @@ static int run_multihop(const char *hostA, uint16_t portA,
     pkt.hops[1]      = ipA;   pkt.hop_ports[1] = portA;
     pkt.hops[2]      = ipB;   pkt.hop_ports[2] = portB;
 
+    /* Capability: EXEC allowed; max 2 hops; budget = 2 (one per node) */
+    pkt.capability.allowed_ops     = ENP_OP_BIT(ENP_EXEC);
+    pkt.capability.cap_max_hops    = 3;   /* hop_count is 3 (return + 2 nodes) */
+    pkt.capability.cap_max_compute = 5;   /* initial budget may be at most 5   */
+    pkt.compute_budget = 2;
+
     /* Payload: input = 3 */
     int32_t input_val = 3;
     encode_i32_payload(&pkt, input_val);
@@ -341,16 +373,111 @@ static int run_multihop(const char *hostA, uint16_t portA,
     }
 
     int32_t result = decode_i32_payload(&response);
-    printf("Multi-hop result: %d (hops traversed: %u)\n",
-           (int)result, (unsigned)response.state[0]);
-    ENP_LOG_INFO("Multi-hop result=%d  state[0]=%u",
-                 (int)result, (unsigned)response.state[0]);
+    printf("Multi-hop result: %d (hops traversed: %u  budget remaining: %u)\n",
+           (int)result, (unsigned)response.state[0],
+           (unsigned)response.compute_budget);
+    ENP_LOG_INFO("Multi-hop result=%d  state[0]=%u  budget_remaining=%u",
+                 (int)result, (unsigned)response.state[0],
+                 (unsigned)response.compute_budget);
 
     if (result == input_val * 4)
         printf("✓ Correct: %d * 2 * 2 = %d\n", input_val, result);
     else
         printf("✗ Unexpected result (expected %d)\n", input_val * 4);
 
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Demo: capability + budget inspection
+ *
+ * (a) Sends an ENP_EXEC packet whose allowed_ops only permits ENP_FORWARD.
+ *     The server should return ENP_FLAG_CAP_DENIED.
+ *
+ * (b) Sends an ENP_EXEC packet with compute_budget = 0.
+ *     The server should return ENP_FLAG_BUDGET_EXHAUSTED.
+ * -------------------------------------------------------------------------*/
+static int run_inspect(const char *host, uint16_t port)
+{
+    printf("=== Capability + Budget Inspection Demo ===\n\n");
+
+    /* ---- (a) Capability denial ---- */
+    printf("(a) ENP_EXEC with allowed_ops=FORWARD_ONLY -> expect CAP_DENIED\n");
+    {
+        enp_packet_t pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.version   = ENP_VERSION;
+        pkt.opcode    = ENP_EXEC;
+        pkt.src       = 0x7F000001u;
+        pkt.dst       = 0x7F000001u;
+        pkt.packet_id = 200;
+        pkt.timestamp = enp_timestamp_ms();
+
+        /* Only ENP_FORWARD is allowed - ENP_EXEC (bit 1) is NOT set */
+        pkt.capability.allowed_ops     = ENP_OP_BIT(ENP_FORWARD);
+        pkt.capability.cap_max_hops    = 0;
+        pkt.capability.cap_max_compute = 0;
+        pkt.compute_budget = ENP_BUDGET_UNLIMITED;
+
+        encode_i32_payload(&pkt, 7);
+        pkt.code_len = (uint16_t)sizeof(PROCESS_WASM);
+        memcpy(pkt.code, PROCESS_WASM, sizeof(PROCESS_WASM));
+
+        enp_packet_t response;
+        memset(&response, 0, sizeof(response));
+
+        int rc = enp_client_send(host, port, &pkt, &response, 5);
+        if (rc == 0 && (response.flags & ENP_FLAG_CAP_DENIED))
+            printf("  -> CAP_DENIED confirmed (flags=0x%04X)\n",
+                   (unsigned)response.flags);
+        else if (rc == 0 && (response.flags & ENP_FLAG_ERROR))
+            printf("  -> Error response (flags=0x%04X)\n",
+                   (unsigned)response.flags);
+        else
+            printf("  -> Unexpected: rc=%d flags=0x%04X\n",
+                   rc, rc == 0 ? (unsigned)response.flags : 0u);
+    }
+
+    printf("\n");
+
+    /* ---- (b) Budget exhaustion ---- */
+    printf("(b) ENP_EXEC with compute_budget=0 -> expect BUDGET_EXHAUSTED\n");
+    {
+        enp_packet_t pkt;
+        memset(&pkt, 0, sizeof(pkt));
+        pkt.version   = ENP_VERSION;
+        pkt.opcode    = ENP_EXEC;
+        pkt.src       = 0x7F000001u;
+        pkt.dst       = 0x7F000001u;
+        pkt.packet_id = 201;
+        pkt.timestamp = enp_timestamp_ms();
+
+        /* All ops permitted; budget already zero */
+        pkt.capability.allowed_ops     = ENP_OP_ALL;
+        pkt.capability.cap_max_hops    = 0;
+        pkt.capability.cap_max_compute = 0;
+        pkt.compute_budget = 0;   /* exhausted before first hop */
+
+        encode_i32_payload(&pkt, 7);
+        pkt.code_len = (uint16_t)sizeof(PROCESS_WASM);
+        memcpy(pkt.code, PROCESS_WASM, sizeof(PROCESS_WASM));
+
+        enp_packet_t response;
+        memset(&response, 0, sizeof(response));
+
+        int rc = enp_client_send(host, port, &pkt, &response, 5);
+        if (rc == 0 && (response.flags & ENP_FLAG_BUDGET_EXHAUSTED))
+            printf("  -> BUDGET_EXHAUSTED confirmed (flags=0x%04X)\n",
+                   (unsigned)response.flags);
+        else if (rc == 0 && (response.flags & ENP_FLAG_ERROR))
+            printf("  -> Error response (flags=0x%04X)\n",
+                   (unsigned)response.flags);
+        else
+            printf("  -> Unexpected: rc=%d flags=0x%04X\n",
+                   rc, rc == 0 ? (unsigned)response.flags : 0u);
+    }
+
+    printf("\n=== Done ===\n");
     return 0;
 }
 
@@ -400,7 +527,15 @@ int main(int argc, char *argv[])
         return run_multihop(hostA, portA, hostB, portB);
     }
 
+    if (strcmp(argv[1], "inspect") == 0) {
+        if (argc < 3) { print_usage(argv[0]); return 1; }
+        const char *host = argv[2];
+        uint16_t    port = ENP_DEFAULT_PORT;
+        if (argc >= 4)
+            port = (uint16_t)atoi(argv[3]);
+        return run_inspect(host, port);
+    }
+
     print_usage(argv[0]);
     return 1;
 }
-

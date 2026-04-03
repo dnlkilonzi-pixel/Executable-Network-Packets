@@ -106,6 +106,11 @@ int enp_packet_serialize(const enp_packet_t *pkt, uint8_t *buf, size_t size)
     }
     /* v2: state */
     memcpy(buf + off, pkt->state, ENP_STATE_LEN); off += ENP_STATE_LEN;
+    /* v3: capability + budget */
+    write_u32_be(buf + off, pkt->capability.allowed_ops);  off += 4;
+    buf[off++] = pkt->capability.cap_max_hops;
+    buf[off++] = pkt->capability.cap_max_compute;
+    write_u16_be(buf + off, pkt->compute_budget);          off += 2;
 
     /* Sanity-check: header size must match */
     if (off != ENP_HEADER_SIZE)
@@ -153,6 +158,11 @@ int enp_packet_deserialize(const uint8_t *buf, size_t size, enp_packet_t *pkt)
     }
     /* v2: state */
     memcpy(pkt->state, buf + off, ENP_STATE_LEN); off += ENP_STATE_LEN;
+    /* v3: capability + budget */
+    pkt->capability.allowed_ops      = read_u32_be(buf + off); off += 4;
+    pkt->capability.cap_max_hops     = buf[off++];
+    pkt->capability.cap_max_compute  = buf[off++];
+    pkt->compute_budget              = read_u16_be(buf + off); off += 2;
 
     /* Validate lengths before accessing variable-length data */
     if (pkt->payload_len > ENP_PAYLOAD_MAX_LEN || pkt->code_len > ENP_CODE_MAX_LEN) {
@@ -242,5 +252,22 @@ uint64_t enp_timestamp_ms(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+#endif
+}
+
+uint64_t enp_timestamp_us(void)
+{
+#ifdef _WIN32
+    FILETIME ft;
+    GetSystemTimeAsFileTime(&ft);
+    uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
+    /* ÷ 10 → microseconds since Windows epoch; − offset → Unix epoch */
+    t /= 10ULL;
+    t -= 11644473600000000ULL;
+    return t;
+#else
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
 #endif
 }

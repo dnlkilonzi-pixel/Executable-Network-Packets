@@ -43,7 +43,8 @@ SRCS = main.c \
        $(NETDIR)/enp_server.c \
        $(NETDIR)/enp_client.c \
        $(WASM_SRCS) \
-       $(UTILSDIR)/enp_logger.c
+       $(UTILSDIR)/enp_logger.c \
+       $(UTILSDIR)/enp_trace.c
 
 OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
 
