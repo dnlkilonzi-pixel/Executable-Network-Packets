@@ -52,7 +52,7 @@ if(ENP_WITH_WASM3)
     # wasm3 exposes a CMake library target "m3" once fetched
     if(TARGET m3)
         target_compile_definitions(enp PRIVATE ENP_WITH_WASM3)
-        target_link_libraries(enp PRIVATE m3 m)
+        target_link_libraries(enp PRIVATE m3)
         target_include_directories(enp PRIVATE
             ${wasm3_SOURCE_DIR}/source
         )

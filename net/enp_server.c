@@ -202,8 +202,11 @@ static void handle_packet(SOCKET sock,
         return;
 
     /* ---- State mutation: increment hop counter ---- */
-    if (out.state[0] < 255)
+    if (out.state[0] < 255) {
         out.state[0]++;
+    } else {
+        ENP_LOG_WARN("state[0] hop-counter overflow at 255 – packet may have looped");
+    }
     ENP_LOG_DBG("State: hop_counter=%u", (unsigned)out.state[0]);
 
     /* ---- Multi-hop routing ---- */

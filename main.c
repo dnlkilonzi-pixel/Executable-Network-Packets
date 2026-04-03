@@ -203,6 +203,7 @@ static int run_client(const char *host, uint16_t port)
 static int run_route(const char *host, uint16_t port)
 {
     int ok = 0;
+    (void)ok;  /* used only to satisfy the drop-confirmation path */
     static const int32_t test_vals[] = {50, 150};
     static const char   *expected[]  = {"FORWARD (50 <= 63, response expected)",
                                         "DROP    (150 > 63,  no response – expect timeout)"};

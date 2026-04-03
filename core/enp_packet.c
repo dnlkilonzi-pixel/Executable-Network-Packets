@@ -232,8 +232,9 @@ uint64_t enp_timestamp_ms(void)
     GetSystemTimeAsFileTime(&ft);
     uint64_t t = ((uint64_t)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
     /* Convert from 100-nanosecond intervals since Windows epoch (1601-01-01)
-     * to milliseconds since Unix epoch (1970-01-01).
-     * Difference: 11644473600000 ms = 116444736000000000 × 100-ns intervals */
+     * to milliseconds since Unix epoch (1970-01-01):
+     *   ÷ 10000   → milliseconds since 1601-01-01
+     *   − 11644473600000  → milliseconds since 1970-01-01 (116444736000000000 intervals) */
     t /= 10000ULL;
     t -= 11644473600000ULL;
     return t;
