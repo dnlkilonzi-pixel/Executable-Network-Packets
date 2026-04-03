@@ -522,6 +522,18 @@ where:
 
 **Stateless** means: a node holds no per-packet or per-session state between datagrams. All state that must persist across hops lives inside the packet's `state[]` buffer. The node's only external inputs are the received datagram and the local clock (used only for `timestamp` updates and WASM timeout enforcement; the clock does not affect routing or execution outcomes).
 
+**Logically stateless, physically state-constrained:** This distinction is important. While a node maintains no application-level state, its physical processing is constrained by fields that are evaluated at execution time and are not carried in the packet itself:
+
+| Constraint source | Where it lives | Nature |
+|-------------------|---------------|--------|
+| Routing table / next-hop address | Encoded in `hops[]` inside the packet | Packet-local; node is pure |
+| Compute budget enforcement | `compute_budget` field inside the packet | Packet-local; node is pure |
+| Hop tracking (`hop_index`) | `hop_index` field inside the packet | Packet-local; node is pure |
+| Capability validation (`allowed_ops`, `cap_max_hops`, `cap_max_compute`) | Capability fields inside the packet | Packet-local; node is pure |
+| WASM execution time limit | Node's local clock (not in packet) | **Physically constrained** — node-local, non-deterministic under load |
+
+All four of the apparent "node-local state" concerns (routing, budget, hop tracking, capability validation) are in fact packet-carried fields — the node is a pure function of the packet. The sole genuine node-local constraint is the WASM timeout clock, which is explicitly excluded from the determinism guarantee in §15.2.
+
 **Practical implication:** Any two nodes running the same binary will process identical packets identically. A single node restarted mid-route will process the next forwarded packet identically to if it had never restarted.
 
 ### 12.2 Delivery Guarantees
@@ -545,6 +557,18 @@ ENP uses UDP as its transport. The following guarantees are provided **by the pr
 
 **Merging:** ENP has no merge primitive. Packets are independent datagrams; once split, their results cannot be combined at the protocol level. Application-level aggregation requires a coordination node that acts as the last hop for multiple packets.
 
+**Formal execution model for CLONE — non-join semilattice:**
+
+ENP's CLONE execution model is a **non-join semilattice**: execution trees can branch (via CLONE) but have no defined join operation. This is an intentional design choice, not an oversight, but it has formal consequences that implementors and users must understand:
+
+| Consequence | Description |
+|-------------|-------------|
+| **Race conditions** | Two branches from the same CLONE originate from the same packet state. If both branches write to a shared coordination node, arrival order is undefined. Applications MUST be designed so that the result is correct regardless of which branch arrives first. |
+| **Divergent state evolution** | After CLONE, each branch carries an independent copy of `state[]`. Mutations in branch A are invisible to branch B. The two execution trees evolve independently and irreconcilably after the split point. |
+| **Non-joinable execution trees** | The protocol provides no mechanism to wait for all branches of a CLONE or to merge their `state[]` buffers. A coordinator that receives N responses from N branches receives N independent state snapshots; it cannot reconstruct the "combined" state without application-level logic. |
+
+**Implication for §15 (Determinism):** Network-level execution of a CLONE path is non-deterministic in delivery order. Node-level execution of each individual branch remains deterministic per §15.2. The determinism guarantee applies to each branch in isolation, not to the aggregate result of a CLONE split.
+
 ### 12.4 Execution Order Across Hops
 
 Execution is **strictly sequential** in a single-path route:
@@ -555,7 +579,7 @@ Node A executes → forwards → Node B executes → forwards → ... → Origin
 
 Node B sees the output of Node A in `payload[]` and the updated `state[]`. There is no parallelism in a linear route.
 
-For routes where CLONE is used (multipath), the order of execution across branches is **undefined** — branches execute concurrently in separate UDP chains. The originator may receive multiple response packets (one per branch). The ENP protocol does not define a merge point; this is left to the application.
+For routes where CLONE is used (multipath), the order of execution across branches is **undefined** — branches execute concurrently in separate UDP chains. The originator may receive multiple response packets (one per branch). The ENP protocol does not define a merge point; this is left to the application. The formal properties of this model — including race conditions, divergent state evolution, and non-joinability — are specified in §12.3.
 
 ---
 
@@ -649,9 +673,17 @@ All **semantic** fields — `payload`, `state`, `compute_budget`, `flags`, `hop_
 
 **Formal statement:**
 
-> Let P be an ENP packet and let N be a node. Define `process(N, P)` as the pair `(action, P_out)` produced by N processing P, ignoring `timestamp` and `exec_us`. Then for all P, N:
+> Let **S** be the *semantic state* of a packet, defined as all wire fields except `timestamp` and `exec_us`. Let **N** be an ENP node and **E** be an execution environment (CPU, OS, WASM interpreter version). Define `process(N, P)` as the pair `(action, P_out)` produced by N processing packet P.
 >
-> `process(N, P) = process(N, P)` — identical inputs always produce identical outputs.
+> **Determinism invariant:** For any two executions of `process(N, P)` under the same N, the same E, and packets P₁, P₂ such that `S(P₁) = S(P₂)`:
+>
+> ```
+> S(process(N, P₁)) = S(process(N, P₂))
+> ```
+>
+> That is: when two input packets are semantically identical (same payload, state, capabilities, budget, opcodes, and routing fields), the node produces semantically identical outputs (same action, same output payload, same state mutation, same flags).
+>
+> **Scope of the guarantee:** The invariant holds within a single execution environment E. Cross-platform behavioral equivalence holds for all semantics except WASM execution timeout, which depends on wall-clock time and is therefore environment-dependent (see §15.1).
 
 ### 15.3 Network-Level Non-Determinism
 
