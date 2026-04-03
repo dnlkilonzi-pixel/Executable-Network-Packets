@@ -19,7 +19,24 @@ BUILDDIR = build
 TARGET   = $(BUILDDIR)/enp
 
 # ---------------------------------------------------------------------------
-# Source files (without wasm3 initially)
+# wasm3 integration
+# Fetch wasm3 with:  make wasm3-fetch
+# Then build with:   make ENP_WITH_WASM3=1
+# ---------------------------------------------------------------------------
+WASM3_DIR      = $(THIRDDIR)
+WASM3_SRC      = $(WASM3_DIR)/source
+WASM3_SRCFILES = $(wildcard $(WASM3_SRC)/m3_*.c)
+
+ifdef ENP_WITH_WASM3
+    WASM_SRCS = wasm/enp_wasm.c $(WASM3_SRCFILES)
+    CFLAGS   += -DENP_WITH_WASM3 -I$(WASM3_SRC)
+    LDFLAGS  += -lm
+else
+    WASM_SRCS = wasm/enp_wasm.c
+endif
+
+# ---------------------------------------------------------------------------
+# Source files
 # ---------------------------------------------------------------------------
 SRCS = main.c \
        $(COREDIR)/enp_packet.c \
@@ -27,24 +44,6 @@ SRCS = main.c \
        $(NETDIR)/enp_client.c \
        $(WASM_SRCS) \
        $(UTILSDIR)/enp_logger.c
-
-OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
-
-# ---------------------------------------------------------------------------
-# wasm3 integration
-# Fetch wasm3 with:  make wasm3-fetch
-# Then build with:   make ENP_WITH_WASM3=1
-# ---------------------------------------------------------------------------
-WASM3_DIR   = $(THIRDDIR)
-WASM3_SRC   = $(WASM3_DIR)/source
-WASM3_SRCFILES = $(wildcard $(WASM3_SRC)/m3_*.c)
-
-ifdef ENP_WITH_WASM3
-    WASM_SRCS   = wasm/enp_wasm.c $(WASM3_SRCFILES)
-    CFLAGS     += -DENP_WITH_WASM3 -I$(WASM3_SRC)
-else
-    WASM_SRCS   = wasm/enp_wasm.c
-endif
 
 OBJS = $(patsubst %.c,$(BUILDDIR)/%.o,$(SRCS))
 

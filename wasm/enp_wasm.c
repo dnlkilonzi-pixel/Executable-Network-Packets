@@ -106,15 +106,15 @@ enp_wasm_result_t enp_wasm_exec(const uint8_t *code, size_t code_len,
     sigaction(SIGALRM, &sa_new, &sa_old);
 
     g_timed_out = 0;
-    unsigned int timeout_secs =
+    unsigned int timeout_sec =
         (ENP_WASM_EXEC_TIMEOUT_MS + 999) / 1000;  /* round up */
-    alarm(timeout_secs);
+    alarm(timeout_sec);
 
     if (sigsetjmp(g_timeout_jmp, 1) == 0) {
         err = m3_CallV(fn, (uint32_t)input);
     } else {
         /* jumped here by SIGALRM handler */
-        ENP_LOG_WARN("wasm3: execution timed out after %u second(s)", timeout_secs);
+        ENP_LOG_WARN("wasm3: execution timed out after %u seconds", timeout_sec);
         result = ENP_WASM_TIMEOUT;
         alarm(0);
         sigaction(SIGALRM, &sa_old, NULL);

@@ -4,6 +4,8 @@
  * Constructs and sends ENP packets to a server, then receives a response.
  */
 
+#define _POSIX_C_SOURCE 200112L
+
 #include "enp_net.h"
 #include "enp_packet.h"
 #include "enp_logger.h"
@@ -57,10 +59,17 @@ int enp_client_send(const char *host, uint16_t port,
         return -1;
     }
 
-    /* Resolve host */
-    struct hostent *he = gethostbyname(host);
-    if (!he) {
-        ENP_LOG_ERR("Cannot resolve host '%s'", host);
+    /* Resolve host using getaddrinfo (thread-safe) */
+    struct addrinfo hints, *res = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family   = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+
+    char port_str[8];
+    snprintf(port_str, sizeof(port_str), "%u", (unsigned)port);
+    int gai_err = getaddrinfo(host, port_str, &hints, &res);
+    if (gai_err != 0 || !res) {
+        ENP_LOG_ERR("Cannot resolve host '%s': %s", host, gai_strerror(gai_err));
         CLOSE_SOCKET(sock);
 #ifdef _WIN32
         WSACleanup();
@@ -70,9 +79,8 @@ int enp_client_send(const char *host, uint16_t port,
 
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
-    server_addr.sin_family = AF_INET;
-    server_addr.sin_port   = htons(port);
-    memcpy(&server_addr.sin_addr, he->h_addr_list[0], (size_t)he->h_length);
+    memcpy(&server_addr, res->ai_addr, res->ai_addrlen);
+    freeaddrinfo(res);
 
     /* Serialize packet */
     uint8_t buf[ENP_MAX_PACKET_SIZE];
@@ -128,10 +136,10 @@ int enp_client_send(const char *host, uint16_t port,
         return -1;
     }
 
+    char from_ip[INET_ADDRSTRLEN];
+    inet_ntop(AF_INET, &from_addr.sin_addr, from_ip, sizeof(from_ip));
     ENP_LOG_INFO("Received %d-byte response from %s:%u",
-                 n,
-                 inet_ntoa(from_addr.sin_addr),
-                 ntohs(from_addr.sin_port));
+                 n, from_ip, ntohs(from_addr.sin_port));
 
     int rc = enp_packet_deserialize(resp_buf, (size_t)n, response);
     if (rc != 0) {

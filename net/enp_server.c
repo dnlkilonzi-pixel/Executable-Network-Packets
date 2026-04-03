@@ -6,6 +6,8 @@
  *   ENP_EXEC     -> executes embedded WASM and returns result
  */
 
+#define _POSIX_C_SOURCE 200112L
+
 #include "enp_net.h"
 #include "enp_packet.h"
 #include "enp_wasm.h"
@@ -190,10 +192,10 @@ int enp_server_run(uint16_t port)
             break;
         }
 
+        char client_ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &client_addr.sin_addr, client_ip, sizeof(client_ip));
         ENP_LOG_DBG("Received %d bytes from %s:%u",
-                    n,
-                    inet_ntoa(client_addr.sin_addr),
-                    ntohs(client_addr.sin_port));
+                    n, client_ip, ntohs(client_addr.sin_port));
 
         handle_packet(sock, buf, (size_t)n, &client_addr, addr_len);
     }
