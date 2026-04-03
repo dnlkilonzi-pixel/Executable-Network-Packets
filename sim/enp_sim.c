@@ -441,7 +441,6 @@ static int run_canonical_demo(void)
     memcpy(&cur, &seed, sizeof(cur));
 
     sim_hop_result_t r;
-    int local_fail = 0;
 
     /* ---- Hop 1: NodeA ---- */
     printf("[Hop 1 – NodeA]\n");
@@ -455,7 +454,6 @@ static int run_canonical_demo(void)
     SIM_ASSERT(r.trace.state_before[0] == 0,     "hop 1: state[0] before=0");
     SIM_ASSERT(r.trace.state_after[0]  == 1,     "hop 1: state[0] after=1");
     SIM_ASSERT(r.out_pkt.hop_index == 2,         "hop 1: hop_index advanced to 2");
-    local_fail = g_failures;
     memcpy(&cur, &r.out_pkt, sizeof(cur));
     printf("\n");
 
@@ -471,7 +469,6 @@ static int run_canonical_demo(void)
     SIM_ASSERT(r.trace.state_before[0] == 1,     "hop 2: state[0] before=1");
     SIM_ASSERT(r.trace.state_after[0]  == 2,     "hop 2: state[0] after=2");
     SIM_ASSERT(r.out_pkt.hop_index == 3,         "hop 2: hop_index advanced to 3");
-    (void)local_fail;
     memcpy(&cur, &r.out_pkt, sizeof(cur));
     printf("\n");
 
